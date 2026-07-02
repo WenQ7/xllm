@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/nn/functional/linear.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -39,8 +40,10 @@ limitations under the License.
 using xllm::dit::DiTParallelLinear;
 using xllm::dit::SpOptions;
 using xllm::dit::TpOptions;
+#if defined(USE_NPU)
 #include "core/layers/npu/loader/rolling_load_manager.h"
 #include "core/layers/npu/loader/rolling_weight_buffer.h"
+#endif
 #include "framework/model_context.h"
 #include "models/dit/transformers/transformer_flux.h"
 #if defined(USE_NPU)
@@ -640,10 +643,23 @@ class WanAttentionImpl : public torch::nn::Module {
         65535);
     torch::Tensor out = std::get<0>(results).transpose(1, 2);
 #else
-    const double scale = 1.0 / std::sqrt(static_cast<double>(dim_head_));
-    auto attn_weights = torch::matmul(q_t, k_t.transpose(-2, -1)) * scale;
-    attn_weights = torch::softmax(attn_weights, -1);
-    torch::Tensor out = torch::matmul(attn_weights, v_t).transpose(1, 2);
+    constexpr int64_t kAttentionChunkSize = 512;
+    torch::Tensor out;
+    if (q_t.size(2) <= kAttentionChunkSize) {
+      out = torch::scaled_dot_product_attention(
+                q_t, k_t, v_t, torch::nullopt, 0.0, false)
+                .transpose(1, 2);
+    } else {
+      std::vector<torch::Tensor> chunks;
+      for (int64_t start = 0; start < q_t.size(2);
+           start += kAttentionChunkSize) {
+        int64_t chunk_size = std::min(kAttentionChunkSize, q_t.size(2) - start);
+        torch::Tensor q_chunk = q_t.narrow(2, start, chunk_size);
+        chunks.emplace_back(torch::scaled_dot_product_attention(
+            q_chunk, k_t, v_t, torch::nullopt, 0.0, false));
+      }
+      out = torch::cat(chunks, 2).transpose(1, 2);
+    }
 #endif
     return out.flatten(2, 3);
   }
